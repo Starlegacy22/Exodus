@@ -72,7 +72,7 @@ local function isOnCooldown(player: Player, abilityName: string, cooldown: numbe
 	local userId = player.UserId
 	cooldowns[userId] = cooldowns[userId] or {}
 	local last = cooldowns[userId][abilityName] or 0
-	-- os.clock is monotonic and more accurate than tick()
+	-- os.clock is more reliable than tick()
 	return (os.clock() - last) < cooldown
 end
 
