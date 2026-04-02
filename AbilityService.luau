@@ -9,65 +9,101 @@ local RunService = game:GetService("RunService")
 
 local Knit = require(ReplicatedStorage.Packages.Knit)
 local Red = require(ReplicatedStorage.Packages.Red)
-
 local Fireball = require(ReplicatedStorage.Abilities.Fireball.Fireball)
-local GalaxyImpact = require(ReplicatedStorage.Abilities.GalaxyImpact.GalaxyImpact)
+local GravityBeam = require(ReplicatedStorage.Abilities.GravityBeam.GravityBeam)
 local Types = require(ReplicatedStorage.Shared.Types)
+
+type CooldownMap = { [number]: { [string]: number } }
+
+-- caches speed and damage at spawn so we're not reading the Config every frame
+type ProjectileState = {
+	caster: Player,
+	damage: number,
+	speed: number,
+	distance: number,
+	maxDistance: number,
+}
+
+-- active is the on/off switch for the pull loop, setting it false stops the loop from outside
+type BeamSession = {
+	active: boolean,
+	target: Model,
+	originAtt: Attachment?,
+	hitAtt: Attachment?,
+}
+
+local ProjectileStateMeta = {}
+ProjectileStateMeta.__index = ProjectileStateMeta
+
+function ProjectileStateMeta.new(caster: Player, damage: number, speed: number, maxDistance: number): ProjectileState
+	return setmetatable({
+		caster = caster,
+		damage = damage,
+		speed = speed,
+		distance = 0,
+		maxDistance = maxDistance,
+	}, ProjectileStateMeta) :: any
+end
 
 local AbilityService = Knit.CreateService {
 	Name = "AbilityService",
 	Client = {},
 }
 
--- each player gets their own table of ability names and when they last used them
-local cooldowns: { [number]: { [string]: number } } = {}
+-- each player gets their own table of ability names and the last time they used them
+local cooldowns: CooldownMap = {}
 
--- each projectile stores its own speed, damage and distance so we don't have to read Config every frame
-local activeProjectiles: { [Part]: { caster: Player, damage: number, speed: number, distance: number, maxDistance: number } } = {}
+-- each projectile part maps to its own state so the Heartbeat loop knows how to move and destroy it
+local activeProjectiles: { [Part]: ProjectileState } = {}
 
--- declared here and assigned in KnitStart because Red needs to initialise before we can open a channel
+-- one beam session per player at a time
+local activeSessions: { [Player]: BeamSession } = {}
+
+-- declared here and assigned in KnitStart because Red needs to be set up before we can use it
 local Net
 
+local function getRoot(model: Model): BasePart?
+	return (model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso")) :: BasePart?
+end
 
--- checks how much time has passed since the player last used this ability
--- if it is less than the cooldown duration, the cast is blocked
+-- checks if enough time has passed since the player last used this ability
+-- if not, the cast is blocked
 local function isOnCooldown(player: Player, abilityName: string, cooldown: number): boolean
 	local userId = player.UserId
 	cooldowns[userId] = cooldowns[userId] or {}
 	local last = cooldowns[userId][abilityName] or 0
-	return (tick() - last) < cooldown
+	-- os.clock is monotonic and more accurate than tick()
+	return (os.clock() - last) < cooldown
 end
 
--- records the current time so the cooldown window starts from this cast
+-- stamps the current time so the cooldown starts from this cast
 local function setCooldown(player: Player, abilityName: string)
 	local userId = player.UserId
 	cooldowns[userId] = cooldowns[userId] or {}
-	cooldowns[userId][abilityName] = tick()
+	cooldowns[userId][abilityName] = os.clock()
 end
 
+local function isCaster(model: Model, caster: Player): boolean
+	return Players:GetPlayerFromCharacter(model) == caster
+end
 
 local function destroyProjectile(projectile: Part, position: Vector3, didHit: boolean)
-	if not activeProjectiles[projectile] then return end -- prevents this running twice on the same projectile
-	activeProjectiles[projectile] = nil -- drop it from the loop immediately before any yields below
+	if not activeProjectiles[projectile] then return end -- stops this running twice on the same projectile
+	activeProjectiles[projectile] = nil -- remove from the loop immediately before anything yields below
 
-	local travelSound = projectile:FindFirstChild("TravelSound")
-	if travelSound then
-		travelSound:Stop()
-	end
+	local travelSound = projectile:FindFirstChild("TravelSound") :: Sound?
+	if travelSound then travelSound:Stop() end
 
-	local impactSound = projectile:FindFirstChild("ImpactSound")
-	if impactSound and didHit then
-		impactSound.Parent = workspace -- move to workspace before destroying the part so the sound is not cut short
-		impactSound:Play()
-		task.delay(3, function()
-			if impactSound and impactSound.Parent then
-				impactSound:Destroy()
-			end
-		end)
-	end
-
-	-- tell every client which effect to play at the position where the projectile stopped
 	if didHit then
+		local impactSound = projectile:FindFirstChild("ImpactSound") :: Sound?
+		if impactSound then
+			-- move to workspace before destroying the part so the sound isn't cut off early
+			impactSound.Parent = workspace
+			impactSound:Play()
+			task.delay(3, function()
+				if impactSound and impactSound.Parent then impactSound:Destroy() end
+			end)
+		end
 		Net:FireAll("AbilityVFX", "FireballExplosion", { Position = position })
 	else
 		Net:FireAll("AbilityVFX", "FireballFizzle", { Position = position })
@@ -76,245 +112,234 @@ local function destroyProjectile(projectile: Part, position: Vector3, didHit: bo
 	projectile:Destroy()
 end
 
-
-local function spawnFireball(caster: Player, data: Types.CastData)
-	local ability = Fireball.new() -- constructor returns the ability object with its Config attached via metatable
-
-	if isOnCooldown(caster, data.AbilityName, ability.Config.Cooldown) then return end
-
-	local char = caster.Character
-	if not char then return end
-
-	local direction = data.Direction.Unit -- normalise the direction so projectile speed is always consistent
-
-	local template = ReplicatedStorage.Abilities.Fireball.FireballVFX
-	local projectile = template:Clone() -- clone the visual so the original template is never modified
-	projectile.CFrame = CFrame.new(data.Origin, data.Origin + direction) -- position it at the origin facing the cast direction
-	projectile.Anchored = true -- we reposition it manually each frame so physics should not move it
-	projectile.CanCollide = false -- hits are detected through raycasting, the physics engine is not involved
-	projectile.Parent = workspace
-
-	local travelSound = projectile:FindFirstChild("TravelSound")
-	if travelSound then
-		travelSound:Play()
-	end
-
-	setCooldown(caster, data.AbilityName)
-
-	-- add to the active table so the Heartbeat loop starts simulating it from the next frame
-	activeProjectiles[projectile] = {
-		caster = caster,
-		damage = ability.Config.BaseDamage,
-		distance = 0,
-		speed = ability.Config.ProjectileSpeed,
-		maxDistance = ability.Config.MaxDistance,
-	}
+local function clearPullConstraint(targetRoot: BasePart)
+	local att = targetRoot:FindFirstChild("_GravityAtt")
+	local lv = targetRoot:FindFirstChild("_GravityLV")
+	if lv then lv:Destroy() end
+	if att then att:Destroy() end
 end
 
+-- recalculates direction every tick so the target curves toward the caster as they both move
+-- uses LinearVelocity because BodyVelocity is deprecated
+local function applyPullTick(ability: typeof(GravityBeam.new()), casterRoot: BasePart, targetRoot: BasePart)
+	local dist = (targetRoot.Position - casterRoot.Position).Magnitude
+	if dist <= ability.Config.StopDistance then
+		clearPullConstraint(targetRoot)
+		return
+	end
 
-local function spawnGalaxyImpact(caster: Player, data: Types.CastData)
-	local ability = GalaxyImpact.new()
+	local direction = (casterRoot.Position - targetRoot.Position).Unit
+	local velocity = direction * ability.Config.PullSpeed
+
+	local lv = targetRoot:FindFirstChild("_GravityLV") :: LinearVelocity?
+	if not lv then
+		local att = Instance.new("Attachment")
+		att.Name = "_GravityAtt"
+		att.Parent = targetRoot
+
+		lv = Instance.new("LinearVelocity")
+		lv.Name = "_GravityLV"
+		lv.Attachment0 = att
+		lv.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+		lv.MaxForce = 1e5
+		lv.RelativeTo = Enum.ActuatorRelativeTo.World
+		lv.Parent = targetRoot
+	end
+
+	(lv :: LinearVelocity).VectorVelocity = velocity
+end
+
+-- grabs the two attachments from the cloned VFX model and parents them to the caster arm and target
+-- so the Beam instance stretches between them automatically, then trashes the empty container
+local function attachBeamVFX(caster: Player, target: Model): (Attachment?, Attachment?)
+	local template = ReplicatedStorage.Abilities.GravityBeam.GravityBeamVFX :: Model
+	local clone = template:Clone()
+
+	local beamFolder = clone:FindFirstChild("Beam")
+	if not beamFolder then clone:Destroy() return nil, nil end
+
+	local originAtt = beamFolder:FindFirstChild("Attachment") :: Attachment?
+	local hitAtt = beamFolder:FindFirstChild("2") :: Attachment?
+	if not originAtt or not hitAtt then clone:Destroy() return nil, nil end
+
+	local leftArm = caster.Character and caster.Character:FindFirstChild("Left Arm") :: BasePart?
+	local targetRoot = getRoot(target)
+	if not leftArm or not targetRoot then clone:Destroy() return nil, nil end
+
+	originAtt.Parent = leftArm
+	originAtt.Position = Vector3.zero
+	hitAtt.Parent = targetRoot
+	hitAtt.Position = Vector3.zero
+
+	clone:Destroy()
+
+	Net:FireAll("AbilityVFX", "GravityBeamStart", { CasterChar = caster.Character, Target = target })
+	return originAtt, hitAtt
+end
+
+local function detachBeamVFX(session: BeamSession, caster: Player)
+	if session.originAtt and session.originAtt.Parent then session.originAtt:Destroy() end
+	if session.hitAtt and session.hitAtt.Parent then session.hitAtt:Destroy() end
+	Net:FireAll("AbilityVFX", "GravityBeamStop", { CasterChar = caster.Character })
+end
+
+local function endSession(player: Player)
+	local session = activeSessions[player]
+	if not session then return end
+	session.active = false
+	activeSessions[player] = nil
+
+	local targetRoot = getRoot(session.target)
+	if targetRoot then clearPullConstraint(targetRoot) end
+
+	detachBeamVFX(session, player)
+end
+
+local function spawnFireball(caster: Player, data: Types.CastData)
+	local ability = Fireball.new() -- constructor returns the ability object with Config attached via metatable
 
 	if isOnCooldown(caster, data.AbilityName, ability.Config.Cooldown) then return end
+	if not caster.Character then return end
 
-	local char = caster.Character
-	if not char then return end
+	local direction = data.Direction.Unit -- normalise so speed is always consistent regardless of what the client sent
 
-	local position = data.Origin + Vector3.new(0, ability.Config.SpawnHeight, 0) -- push the spawn point up so the vortex sits above the ground
+	local template = ReplicatedStorage.Abilities.Fireball.FireballVFX :: Part
+	local projectile = template:Clone() :: Part -- clone so the original template is never modified
+
+	-- lookAt points LookVector at the travel direction, which the raycast reads each frame
+	projectile.CFrame = CFrame.lookAt(data.Origin, data.Origin + direction)
+	projectile.Anchored = true    -- moved manually each frame, physics shouldn't touch it
+	projectile.CanCollide = false -- hits come from the raycast, not the physics engine
+	projectile.Parent = workspace
+
+	local travelSound = projectile:FindFirstChild("TravelSound") :: Sound?
+	if travelSound then travelSound:Play() end
+
 	setCooldown(caster, data.AbilityName)
 
-	local template = ReplicatedStorage.Abilities.GalaxyImpact.GalaxyImpactVFX
-	local vortex = template:Clone()
-	vortex:PivotTo(CFrame.new(position))
-	vortex.Parent = workspace
+	-- longer charge = more damage, CalculateDamage handles the scaling curve
+	local chargeTime = data.ChargeTime or 0
+	local damage = ability:CalculateDamage(chargeTime)
 
-	-- collect all emitters and beams into arrays before any loops run so we never call GetDescendants per frame
-	local emitters: { { emitter: ParticleEmitter, originalRate: number } } = {}
-	local beams: { Beam } = {}
+	-- add to the active table so the Heartbeat loop picks it up next frame
+	activeProjectiles[projectile] = ProjectileStateMeta.new(
+		caster,
+		damage,
+		ability.Config.ProjectileSpeed,
+		ability.Config.MaxDistance
+	)
+end
 
-	for _, obj in vortex:GetDescendants() do
-		if obj:IsA("ParticleEmitter") then
-			local originalRate = obj.Rate
-			obj.Rate = 0 -- silence it at spawn so the fade-in below controls when it becomes visible
-			table.insert(emitters, { emitter = obj, originalRate = originalRate })
-		elseif obj:IsA("Beam") then
-			obj.Transparency = NumberSequence.new(1) -- fully transparent at spawn, faded in below
-			table.insert(beams, obj)
-		end
+local function startGravityBeam(caster: Player, data: Types.CastData)
+	local ability = GravityBeam.new()
+	if isOnCooldown(caster, data.AbilityName, ability.Config.Cooldown) then return end
+	if activeSessions[caster] then return end -- one beam at a time per player
+
+	local casterChar = caster.Character
+	if not casterChar then return end
+
+	local casterRoot = casterChar:FindFirstChild("HumanoidRootPart") :: BasePart?
+	if not casterRoot then return end
+
+	local targetInstance = data.TargetInstance :: Instance?
+	if not targetInstance then return end
+
+	-- walk up from the clicked part until we find a model that has a Humanoid
+	local target = targetInstance :: Model
+	while target and not target:FindFirstChildOfClass("Humanoid") do
+		target = target.Parent :: Model
 	end
+	if not target then return end
+	if isCaster(target, caster) then return end -- can't beam yourself
 
-	local sound = vortex:FindFirstChild("VortexSound")
-	if sound then
-		sound:Play()
-	end
+	local targetRoot = getRoot(target)
+	if not targetRoot then return end
+	if not ability:InRange(casterRoot, targetRoot) then return end
 
-	-- run the fade-in on a separate thread so it does not pause the function that called it
-	-- 20 steps gives a smooth enough ramp without running too many iterations
+	local originAtt, hitAtt = attachBeamVFX(caster, target)
+
+	local session: BeamSession = {
+		active = true,
+		target = target,
+		originAtt = originAtt,
+		hitAtt = hitAtt,
+	}
+	activeSessions[caster] = session
+	setCooldown(caster, data.AbilityName)
+
+	-- runs on its own thread so it doesn't block anything else
+	-- session.active = false is what stops the loop cleanly
 	task.spawn(function()
-		local steps = 20
-		for i = 1, steps do
-			for _, entry in emitters do
-				if entry.emitter and entry.emitter.Parent then
-					entry.emitter.Rate = (i / steps) * entry.originalRate -- gradually bring each emitter up to its original rate
-				end
-			end
-			for _, beam in beams do
-				if beam and beam.Parent then
-					beam.Transparency = NumberSequence.new(1 - (i / steps)) -- reduce transparency each step until fully visible
-				end
-			end
-			task.wait(1 / steps)
-		end
-	end)
+		local elapsed = 0
+		while session.active and elapsed < ability.Config.MaxChargeTime do
+			local currentCasterRoot = casterChar:FindFirstChild("HumanoidRootPart") :: BasePart?
+			local currentTargetRoot = getRoot(target)
+			if not currentCasterRoot or not currentTargetRoot then break end
 
-	local elapsed = 0
-	local damageTickRate = 0.5 -- without this cap, damage would scale with frame rate instead of time
-	local lastDamageTick = 0
-	local connection
+			local hum = target:FindFirstChildWhichIsA("Humanoid") :: Humanoid?
+			if not hum or hum.Health <= 0 then break end
 
-	connection = RunService.Heartbeat:Connect(function(dt)
-		if not vortex or not vortex.Parent then
-			connection:Disconnect()
-			return
+			applyPullTick(ability, currentCasterRoot, currentTargetRoot)
+			task.wait(ability.Config.TickRate)
+			elapsed += ability.Config.TickRate
 		end
 
-		elapsed += dt
-
-		local parts = workspace:GetPartBoundsInRadius(position, ability.Config.SuctionRadius)
-		local hitModels: { [Model]: boolean } = {}
-
-		for _, part in parts do
-			local model = part:FindFirstAncestorWhichIsA("Model")
-			if not model then continue end
-			if hitModels[model] then continue end -- characters have many parts, we only want to process each character once
-
-			local hum = model:FindFirstChildWhichIsA("Humanoid")
-			if not hum then continue end
-			if hum.Health <= 0 then continue end
-
-			local targetPlayer = Players:GetPlayerFromCharacter(model)
-			if targetPlayer == caster then continue end -- the caster should not be pulled by their own vortex
-
-			local root = model:FindFirstChild("HumanoidRootPart")
-			if not root then continue end
-
-			hitModels[model] = true
-
-			local dist = (position - root.Position).Magnitude
-			local dir = (position - root.Position).Unit -- direction from the character toward the vortex centre
-
-			if dist <= ability.Config.KillRadius then
-				hum.Health = 0 -- anything inside the inner radius dies immediately
-				continue
-			end
-
-			-- BodyVelocity applies a steady force every frame rather than a single push
-			-- this keeps the pull smooth and consistent regardless of frame rate
-			-- we reuse an existing one if it is already on the character to avoid creating a new instance every frame
-			local bv = root:FindFirstChild("GalaxyBV") or Instance.new("BodyVelocity")
-			bv.Name = "GalaxyBV"
-			bv.Velocity = dir * ability.Config.SuctionForce
-			bv.MaxForce = Vector3.new(1e5, 1e5, 1e5) -- high enough to override the default character movement forces
-			bv.P = 1e4
-			bv.Parent = root
-
-			if elapsed - lastDamageTick >= damageTickRate then
+		-- damage is applied once at the end of the hold, not every tick
+		if session.active then
+			local hum = target:FindFirstChildWhichIsA("Humanoid") :: Humanoid?
+			if hum and hum.Health > 0 then
 				hum:TakeDamage(ability.Config.BaseDamage)
 			end
 		end
 
-		if elapsed - lastDamageTick >= damageTickRate then
-			lastDamageTick = elapsed
-		end
-
-		if elapsed >= ability.Config.Duration then
-			connection:Disconnect()
-
-			-- remove the suction force from every character so they are not stuck being pulled after the vortex ends
-			for _, p in workspace:GetChildren() do
-				if p:IsA("Model") then
-					local root = p:FindFirstChild("HumanoidRootPart")
-					if root then
-						local bv = root:FindFirstChild("GalaxyBV")
-						if bv then bv:Destroy() end
-					end
-				end
-			end
-
-			local vortexSound = vortex:FindFirstChild("VortexSound")
-			if vortexSound then
-				vortexSound:Stop()
-			end
-
-			-- run the same fade logic in reverse so the vortex gradually disappears instead of vanishing instantly
-			task.spawn(function()
-				local steps = 20
-				for i = steps, 0, -1 do
-					for _, entry in emitters do
-						if entry.emitter and entry.emitter.Parent then
-							entry.emitter.Rate = (i / steps) * entry.originalRate
-						end
-					end
-					for _, beam in beams do
-						if beam and beam.Parent then
-							beam.Transparency = NumberSequence.new(1 - (i / steps))
-						end
-					end
-					task.wait(2 / steps)
-				end
-
-				task.delay(2, function()
-					if vortex and vortex.Parent then
-						vortex:Destroy() -- small delay so any remaining particles finish before the model is removed
-					end
-				end)
-			end)
-		end
+		endSession(caster)
 	end)
 end
 
 
 function AbilityService:KnitStart()
-	-- open the Red channel and declare which events will be sent between server and client
+	-- open the Red channel and register which events are allowed through it
 	Net = Red.Server("AbilityNet", {
 		"AbilityCast",
 		"AbilityVFX",
 	})
 
-	-- listen for incoming cast requests and route them to the correct ability function
+	-- listen for cast requests from clients and route them to the right function
 	Net:On("AbilityCast", function(player: Player, data: Types.CastData)
 		if data.AbilityName == "Fireball" then
 			spawnFireball(player, data)
-		elseif data.AbilityName == "GalaxyImpact" then
-			spawnGalaxyImpact(player, data)
+		elseif data.AbilityName == "GravityBeam" then
+			startGravityBeam(player, data)
+		elseif data.AbilityName == "GravityBeam_End" then
+			endSession(player)
 		end
 	end)
 
-	-- one shared Heartbeat connection steps all active projectiles to avoid multiple connections running at once
+	-- one connection moves every active projectile instead of one connection per projectile
 	RunService.Heartbeat:Connect(function(dt: number)
 		for projectile, state in activeProjectiles do
 			if not projectile.Parent then
-				activeProjectiles[projectile] = nil -- part no longer exists, remove it from the table
+				activeProjectiles[projectile] = nil -- part is gone, clean it up
 				continue
 			end
 
-			local frame = projectile.CFrame
-			local stepDistance = state.speed * dt -- multiply by delta time so movement speed does not change with frame rate
+			local frame = projectile.CFrame :: CFrame
+			local stepDistance = state.speed * dt -- multiply by delta time so speed doesn't change with frame rate
 
 			local rayParams = RaycastParams.new()
 			rayParams.FilterType = Enum.RaycastFilterType.Exclude
-			rayParams.FilterDescendantsInstances = { state.caster.Character, projectile } -- stop the ray hitting the caster or the projectile itself
+			-- exclude the caster and the projectile itself so the ray never hits either of them
+			rayParams.FilterDescendantsInstances = { state.caster.Character or Instance.new("Folder"), projectile }
 
 			local result = workspace:Raycast(frame.Position, frame.LookVector * stepDistance, rayParams)
 
 			if result then
-				local hit = result.Instance
+				local hit = result.Instance :: BasePart
 				local model = hit:FindFirstAncestorWhichIsA("Model")
-				local hum = model and model:FindFirstChildWhichIsA("Humanoid")
 
-				if hum and hum.Health > 0 then
-					local targetPlayer = Players:GetPlayerFromCharacter(model)
-					if targetPlayer ~= state.caster then
+				if model and not isCaster(model, state.caster) then
+					local hum = model:FindFirstChildWhichIsA("Humanoid") :: Humanoid?
+					if hum and hum.Health > 0 then
 						hum:TakeDamage(state.damage)
 					end
 				end
@@ -323,19 +348,37 @@ function AbilityService:KnitStart()
 				continue
 			end
 
-			projectile.CFrame = frame + frame.LookVector * stepDistance -- move the projectile forward by this frame's distance
+			projectile.CFrame = frame + frame.LookVector * stepDistance -- move it forward by this frame's distance
 			state.distance += stepDistance
 
 			if state.distance >= state.maxDistance then
-				destroyProjectile(projectile, projectile.Position, false) -- hit nothing and reached the range limit
+				destroyProjectile(projectile, projectile.Position, false) -- reached max range without hitting anything
 			end
 		end
 	end)
 
-	-- remove the player's cooldown data when they leave so it does not sit in memory indefinitely
 	Players.PlayerRemoving:Connect(function(player: Player)
-		cooldowns[player.UserId] = nil
+		endSession(player)
+		cooldowns[player.UserId] = nil -- clear their data so it doesn't sit in memory after they leave
 	end)
+
+	local function hookCharacter(player: Player)
+		player.CharacterAdded:Connect(function(char: Model)
+			-- clean up any leftover pull constraints from before the respawn
+			local root = char:WaitForChild("HumanoidRootPart") :: BasePart
+			local lv = root:FindFirstChild("_GravityLV")
+			local att = root:FindFirstChild("_GravityAtt")
+			if lv then lv:Destroy() end
+			if att then att:Destroy() end
+		end)
+	end
+
+	-- hook players already in the game in case Knit starts late
+	for _, player in Players:GetPlayers() do
+		hookCharacter(player)
+	end
+
+	Players.PlayerAdded:Connect(hookCharacter)
 end
 
 return AbilityService
